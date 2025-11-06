@@ -1,4 +1,4 @@
-# app.py
+# app.py — FAISS version (no chromadb needed)
 import os
 import tempfile
 from pathlib import Path
@@ -6,9 +6,11 @@ from typing import List, Tuple
 
 import streamlit as st
 
-# Community integrations
-from langchain_community.vectorstores import Chroma
+# Load PDFs
 from langchain_community.document_loaders import PyPDFLoader
+
+# Vector store: FAISS (installed: faiss-cpu)
+from langchain_community.vectorstores import FAISS
 
 # OpenAI wrappers
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -23,7 +25,7 @@ except ModuleNotFoundError:
 # --------------------------- UI CONFIG --------------------------- #
 st.set_page_config(page_title="Manual Bot", page_icon="📚", layout="wide")
 st.title("📚 Manual Bot")
-st.caption("Upload PDFs or use PDFs in your repo (e.g., manual.pdf) → index with Chroma → ask questions. OpenAI embeddings + ChatOpenAI (LangChain 1.x).")
+st.caption("Upload PDFs or use PDFs in your repo (e.g., manual.pdf) → index with FAISS → ask questions. OpenAI embeddings + ChatOpenAI (LangChain 1.x).")
 
 # --------------------------- ENV / KEYS --------------------------- #
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -52,13 +54,10 @@ with st.sidebar:
     st.caption("Re-index after changing chunking. Index is persisted to a temp dir for this session.")
 
 # --------------------------- PERSISTENCE --------------------------- #
+# Use a temp folder for FAISS persistence
 if "persist_dir" not in st.session_state:
-    st.session_state.persist_dir = str(Path(tempfile.gettempdir()) / "manual_bot_chroma")
-if "collection_name" not in st.session_state:
-    st.session_state.collection_name = "manual-bot"
-
+    st.session_state.persist_dir = str(Path(tempfile.gettempdir()) / "manual_bot_faiss")
 PERSIST_DIR = st.session_state.persist_dir
-COLLECTION = st.session_state.collection_name
 
 # Repo root (where this file lives)
 REPO_DIR = Path(__file__).resolve().parent
@@ -104,73 +103,28 @@ def load_repo_pdfs_to_docs(paths: List[Path]) -> List:
 
 
 def find_repo_pdfs(repo_dir: Path) -> List[Path]:
-    """
-    Discover PDFs in the repository.
-    Priority: 'manual.pdf' in repo root; also include any other *.pdf in the root.
-    Extend this to search subfolders if you prefer (e.g., repo_dir.rglob('*.pdf')).
-    """
+    """Discover PDFs in the repo root, prioritising manual.pdf."""
     candidates: List[Path] = []
     manual = repo_dir / "manual.pdf"
     if manual.exists() and manual.is_file():
         candidates.append(manual)
-
-    # Also pick up any other PDFs in the repo root (excluding manual if already added)
     for p in sorted(repo_dir.glob("*.pdf")):
         if p not in candidates:
             candidates.append(p)
-
     return candidates
 
 
-@st.cache_resource(show_spinner=False)
-def build_or_load_vectorstore(
-    docs: List,
-    embedding_model_name: str,
-    chunk_size: int,
-    chunk_overlap: int,
-    persist_dir: str,
-    collection_name: str,
-):
-    """Create or load Chroma vectorstore. If docs provided, (re)build index."""
-    embeddings = OpenAIEmbeddings(model=embedding_model_name, api_key=OPENAI_API_KEY)
-
-    if docs:
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", " ", ""],
-        )
-        chunks = splitter.split_documents(docs)
-
-        vs = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            collection_name=collection_name,
-            persist_directory=persist_dir,
-        )
-        vs.persist()
-        return vs
-
-    return Chroma(
-        embedding_function=embeddings,
-        collection_name=collection_name,
-        persist_directory=persist_dir,
-    )
-
-
 def clear_index(persist_dir: str):
-    """Delete the Chroma persist directory to rebuild from scratch."""
+    """Delete the FAISS persist directory to rebuild from scratch."""
     root = Path(persist_dir)
     if not root.exists():
         return
-    # remove files
     for p in root.glob("**/*"):
         try:
             if p.is_file():
                 p.unlink(missing_ok=True)
         except Exception:
             pass
-    # remove dirs (post-order)
     for p in sorted(root.glob("**/*"), reverse=True):
         try:
             if p.is_dir():
@@ -183,13 +137,54 @@ def clear_index(persist_dir: str):
         pass
 
 
-def simple_rag_answer(vs: Chroma, model_name: str, query: str, k: int) -> Tuple[str, List]:
+def save_faiss_index(vs: FAISS, path: str):
+    Path(path).mkdir(parents=True, exist_ok=True)
+    vs.save_local(path)
+
+
+def load_faiss_index(path: str, embeddings: OpenAIEmbeddings) -> FAISS | None:
+    p = Path(path)
+    if not p.exists():
+        return None
+    # allow_dangerous_deserialization is required by FAISS loader in LangChain
+    return FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
+
+
+def build_or_load_vectorstore(
+    docs: List,
+    embedding_model_name: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    persist_dir: str,
+) -> FAISS:
     """
-    Minimal RAG without langchain.chains:
-    1) Retrieve top-k docs
-    2) Build a compact prompt with context
-    3) Call the LLM directly
+    Create or load FAISS vectorstore.
+    If docs provided, (re)build index and save; otherwise try loading from disk.
     """
+    embeddings = OpenAIEmbeddings(model=embedding_model_name, api_key=OPENAI_API_KEY)
+
+    if docs:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", " ", ""],
+        )
+        chunks = splitter.split_documents(docs)
+        vs = FAISS.from_documents(chunks, embeddings)
+        save_faiss_index(vs, persist_dir)
+        return vs
+
+    loaded = load_faiss_index(persist_dir, embeddings)
+    if loaded is None:
+        # Create an empty index so app logic can proceed
+        vs = FAISS.from_texts([""], embeddings, metadatas=[{"source": "empty"}])
+        save_faiss_index(vs, persist_dir)
+        return vs
+    return loaded
+
+
+def simple_rag_answer(vs: FAISS, model_name: str, query: str, k: int) -> Tuple[str, List]:
+    """Minimal RAG: retrieve top-k, build prompt, call LLM."""
     retriever = vs.as_retriever(search_kwargs={"k": k})
     docs = retriever.get_relevant_documents(query)
 
@@ -245,7 +240,6 @@ with col3:
 
 if wiped:
     clear_index(PERSIST_DIR)
-    build_or_load_vectorstore.clear()
     st.success("Cleared index. Rebuild with new PDFs when ready.")
 
 vs = None
@@ -255,14 +249,12 @@ indexed_from = None
 if rebuild_uploaded and uploaded:
     with st.spinner("Building index from uploaded PDFs…"):
         docs = load_pdfs_to_docs(uploaded)
-        build_or_load_vectorstore.clear()
         vs = build_or_load_vectorstore(
             docs=docs,
             embedding_model_name=embed_model,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             persist_dir=PERSIST_DIR,
-            collection_name=COLLECTION,
         )
         indexed_from = f"{len(uploaded)} uploaded file(s)"
         st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
@@ -271,14 +263,12 @@ if rebuild_uploaded and uploaded:
 if rebuild_repo and repo_pdf_paths:
     with st.spinner("Building index from repo PDFs…"):
         docs = load_repo_pdfs_to_docs(repo_pdf_paths)
-        build_or_load_vectorstore.clear()
         vs = build_or_load_vectorstore(
             docs=docs,
             embedding_model_name=embed_model,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             persist_dir=PERSIST_DIR,
-            collection_name=COLLECTION,
         )
         indexed_from = f"{len(repo_pdf_paths)} repo file(s)"
         st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
@@ -290,28 +280,27 @@ if vs is None:
         if not index_exists and auto_index_repo and repo_pdf_paths:
             with st.spinner("No existing index. Auto-indexing repo PDFs…"):
                 docs = load_repo_pdfs_to_docs(repo_pdf_paths)
-                build_or_load_vectorstore.clear()
                 vs = build_or_load_vectorstore(
                     docs=docs,
                     embedding_model_name=embed_model,
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
                     persist_dir=PERSIST_DIR,
-                    collection_name=COLLECTION,
                 )
                 indexed_from = f"{len(repo_pdf_paths)} repo file(s) (auto)"
                 st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
         else:
+            # Load existing FAISS index (or create empty)
             vs = build_or_load_vectorstore(
                 docs=[],
                 embedding_model_name=embed_model,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
                 persist_dir=PERSIST_DIR,
-                collection_name=COLLECTION,
             )
-    except Exception:
+    except Exception as e:
         st.info("No existing index yet. Upload PDFs or click **Index repo PDFs**.")
+        st.caption(str(e))
 
 st.divider()
 st.subheader("2) Ask questions about your manuals")
@@ -352,7 +341,6 @@ with st.expander("ℹ️ Debug / Info"):
         except Exception:
             st.write(f"- {p.name}: (stat unavailable)")
     st.write("Persist directory:", PERSIST_DIR)
-    st.write("Collection name:", COLLECTION)
     st.write("LLM model:", llm_model)
     st.write("Embedding model:", embed_model)
     st.write("Chunking:", {"size": chunk_size, "overlap": chunk_overlap})
