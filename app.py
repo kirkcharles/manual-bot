@@ -1,15 +1,19 @@
-# app.py — FAISS version (no chromadb needed)
+# app.py — FAISS + backoff + repo-PDF discovery
 import os
+import time
+import random
 import tempfile
 from pathlib import Path
 from typing import List, Tuple
 
+import numpy as np
 import streamlit as st
+from openai import RateLimitError
 
-# Load PDFs
+# PDF loader
 from langchain_community.document_loaders import PyPDFLoader
 
-# Vector store: FAISS (installed: faiss-cpu)
+# Vector store: FAISS (requires faiss-cpu)
 from langchain_community.vectorstores import FAISS
 
 # OpenAI wrappers
@@ -21,11 +25,22 @@ try:
 except ModuleNotFoundError:
     from langchain.text_splitter import RecursiveCharacterTextSplitter  # legacy
 
+# Docstore + FAISS helper import (path compatibility)
+try:
+    from langchain.docstore import InMemoryDocstore
+except Exception:  # older/newer LC fallback
+    from langchain.docstore.in_memory import InMemoryDocstore
+
+from uuid import uuid4
+
 
 # --------------------------- UI CONFIG --------------------------- #
 st.set_page_config(page_title="Manual Bot", page_icon="📚", layout="wide")
 st.title("📚 Manual Bot")
-st.caption("Upload PDFs or use PDFs in your repo (e.g., manual.pdf) → index with FAISS → ask questions. OpenAI embeddings + ChatOpenAI (LangChain 1.x).")
+st.caption(
+    "Upload PDFs or index PDFs in your repo (e.g., manual.pdf) → FAISS index → ask questions. "
+    "OpenAI embeddings + ChatOpenAI (LangChain 1.x)."
+)
 
 # --------------------------- ENV / KEYS --------------------------- #
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -45,16 +60,16 @@ with st.sidebar:
         options=["text-embedding-3-small", "text-embedding-3-large"],
         index=0,
     )
-    chunk_size = st.slider("Chunk size", 300, 3000, 1000, 50)
-    chunk_overlap = st.slider("Chunk overlap", 0, 400, 150, 10)
+    chunk_size = st.slider("Chunk size", 300, 3000, 1200, 50)
+    chunk_overlap = st.slider("Chunk overlap", 0, 400, 100, 10)
     k_docs = st.slider("Top-K documents", 1, 10, 4, 1)
 
     st.divider()
     auto_index_repo = st.checkbox("Auto-index repo PDFs on first run (if no index yet)", value=True)
-    st.caption("Re-index after changing chunking. Index is persisted to a temp dir for this session.")
+    st.caption("The FAISS index is saved to a temp dir for this session.")
 
 # --------------------------- PERSISTENCE --------------------------- #
-# Use a temp folder for FAISS persistence
+# Temp folder for FAISS persistence (survives reruns; not rebuilds)
 if "persist_dir" not in st.session_state:
     st.session_state.persist_dir = str(Path(tempfile.gettempdir()) / "manual_bot_faiss")
 PERSIST_DIR = st.session_state.persist_dir
@@ -103,7 +118,11 @@ def load_repo_pdfs_to_docs(paths: List[Path]) -> List:
 
 
 def find_repo_pdfs(repo_dir: Path) -> List[Path]:
-    """Discover PDFs in the repo root, prioritising manual.pdf."""
+    """
+    Discover PDFs in the repo root.
+    Priority: 'manual.pdf' in repo root; also include any other *.pdf in the root.
+    (Switch to repo_dir.rglob('*.pdf') if you want subfolders too.)
+    """
     candidates: List[Path] = []
     manual = repo_dir / "manual.pdf"
     if manual.exists() and manual.is_file():
@@ -150,6 +169,28 @@ def load_faiss_index(path: str, embeddings: OpenAIEmbeddings) -> FAISS | None:
     return FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
 
 
+def embed_texts_with_backoff(embeddings, texts, batch_size=16, max_retries=8, base_sleep=1.0):
+    """
+    Embed texts in small batches with exponential backoff on rate limits.
+    Returns a list of embedding vectors of the same length as texts.
+    """
+    results = []
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start: start + batch_size]
+        attempt = 0
+        while True:
+            try:
+                results.extend(embeddings.embed_documents(batch))
+                break
+            except RateLimitError:
+                sleep_s = min((base_sleep * (2 ** attempt)) + random.uniform(0, 0.5), 30)
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                time.sleep(sleep_s)
+    return results
+
+
 def build_or_load_vectorstore(
     docs: List,
     embedding_model_name: str,
@@ -160,9 +201,22 @@ def build_or_load_vectorstore(
     """
     Create or load FAISS vectorstore.
     If docs provided, (re)build index and save; otherwise try loading from disk.
+    Uses backoff-aware embedding to avoid OpenAI rate limits.
     """
-    embeddings = OpenAIEmbeddings(model=embedding_model_name, api_key=OPENAI_API_KEY)
+    embeddings = OpenAIEmbeddings(
+        model=embedding_model_name,
+        api_key=OPENAI_API_KEY,
+        max_retries=10,  # client-level retries for transient issues
+        timeout=60,
+    )
 
+    # 1) If no docs, try loading an existing index first to avoid re-embedding
+    if not docs:
+        loaded = load_faiss_index(persist_dir, embeddings)
+        if loaded is not None:
+            return loaded
+
+    # 2) If we have docs, chunk them and embed with throttling
     if docs:
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
@@ -170,17 +224,50 @@ def build_or_load_vectorstore(
             separators=["\n\n", "\n", " ", ""],
         )
         chunks = splitter.split_documents(docs)
-        vs = FAISS.from_documents(chunks, embeddings)
+
+        # Optional guardrail to reduce calls if many chunks
+        MAX_CHUNKS = 4000
+        if len(chunks) > MAX_CHUNKS:
+            step = max(1, len(chunks) // MAX_CHUNKS)
+            chunks = chunks[::step]
+
+        texts = [c.page_content for c in chunks]
+
+        # ---- backoff-aware embeddings ----
+        vectors = embed_texts_with_backoff(
+            embeddings=embeddings,
+            texts=texts,
+            batch_size=16,   # smaller batches reduce spikes
+            max_retries=8,   # total tries per batch: 1 + 8
+            base_sleep=1.0,  # starting delay
+        )
+
+        # Build FAISS index directly from precomputed vectors + docs (no re-embedding)
+        from langchain_community.vectorstores.faiss import dependable_faiss_import
+        faiss = dependable_faiss_import()
+
+        dim = len(vectors[0]) if vectors else 1536  # fallback dimension
+        index = faiss.IndexFlatL2(dim)
+        vs = FAISS(
+            embedding_function=embeddings,
+            index=index,
+            docstore=InMemoryDocstore({}),
+            index_to_docstore_id={},
+        )
+
+        ids = [str(uuid4()) for _ in vectors]
+        vs.index.add(np.array(vectors, dtype="float32"))
+        for i, _id in enumerate(ids):
+            vs.docstore.add({_id: chunks[i]})
+            vs.index_to_docstore_id[len(vs.index_to_docstore_id)] = _id
+
         save_faiss_index(vs, persist_dir)
         return vs
 
-    loaded = load_faiss_index(persist_dir, embeddings)
-    if loaded is None:
-        # Create an empty index so app logic can proceed
-        vs = FAISS.from_texts([""], embeddings, metadatas=[{"source": "empty"}])
-        save_faiss_index(vs, persist_dir)
-        return vs
-    return loaded
+    # 3) If no docs and nothing on disk, create a tiny empty index
+    vs = FAISS.from_texts([""], embeddings, metadatas=[{"source": "empty"}])
+    save_faiss_index(vs, persist_dir)
+    return vs
 
 
 def simple_rag_answer(vs: FAISS, model_name: str, query: str, k: int) -> Tuple[str, List]:
@@ -257,7 +344,7 @@ if rebuild_uploaded and uploaded:
             persist_dir=PERSIST_DIR,
         )
         indexed_from = f"{len(uploaded)} uploaded file(s)"
-        st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
+    st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
 
 # Option 2: Index repo PDFs
 if rebuild_repo and repo_pdf_paths:
@@ -271,7 +358,7 @@ if rebuild_repo and repo_pdf_paths:
             persist_dir=PERSIST_DIR,
         )
         indexed_from = f"{len(repo_pdf_paths)} repo file(s)"
-        st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
+    st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
 
 # If no explicit rebuild, try to load existing store (and optionally auto-index repo PDFs)
 if vs is None:
@@ -288,7 +375,7 @@ if vs is None:
                     persist_dir=PERSIST_DIR,
                 )
                 indexed_from = f"{len(repo_pdf_paths)} repo file(s) (auto)"
-                st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
+            st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
         else:
             # Load existing FAISS index (or create empty)
             vs = build_or_load_vectorstore(
