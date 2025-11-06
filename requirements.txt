@@ -1,8 +1,9 @@
 streamlit
 openai
 pypdf
-chromadb
-langchain==0.2.16
-langchain-openai==0.1.23
-langchain-community==0.2.16
-langchain-text-splitters==0.2.16
+tiktoken
+faiss-cpu
+langchain
+langchain-openai
+langchain-community
+langchain-text-splitters
