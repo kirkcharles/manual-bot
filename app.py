@@ -19,10 +19,11 @@ try:
 except ModuleNotFoundError:
     from langchain.text_splitter import RecursiveCharacterTextSplitter  # legacy
 
+
 # --------------------------- UI CONFIG --------------------------- #
 st.set_page_config(page_title="Manual Bot", page_icon="📚", layout="wide")
 st.title("📚 Manual Bot")
-st.caption("Upload PDFs → index with Chroma → ask questions. OpenAI embeddings + ChatOpenAI (LangChain 1.x).")
+st.caption("Upload PDFs or use PDFs in your repo (e.g., manual.pdf) → index with Chroma → ask questions. OpenAI embeddings + ChatOpenAI (LangChain 1.x).")
 
 # --------------------------- ENV / KEYS --------------------------- #
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -47,6 +48,7 @@ with st.sidebar:
     k_docs = st.slider("Top-K documents", 1, 10, 4, 1)
 
     st.divider()
+    auto_index_repo = st.checkbox("Auto-index repo PDFs on first run (if no index yet)", value=True)
     st.caption("Re-index after changing chunking. Index is persisted to a temp dir for this session.")
 
 # --------------------------- PERSISTENCE --------------------------- #
@@ -58,9 +60,13 @@ if "collection_name" not in st.session_state:
 PERSIST_DIR = st.session_state.persist_dir
 COLLECTION = st.session_state.collection_name
 
+# Repo root (where this file lives)
+REPO_DIR = Path(__file__).resolve().parent
+
+
 # --------------------------- HELPERS --------------------------- #
 def load_pdfs_to_docs(uploaded_files) -> List:
-    """Load each uploaded PDF into LangChain Documents via PyPDFLoader."""
+    """Load uploaded PDFs into LangChain Documents via PyPDFLoader."""
     docs = []
     for up in uploaded_files:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -79,6 +85,41 @@ def load_pdfs_to_docs(uploaded_files) -> List:
             except Exception:
                 pass
     return docs
+
+
+def load_repo_pdfs_to_docs(paths: List[Path]) -> List:
+    """Load repo PDFs (existing on disk) into LangChain Documents."""
+    docs = []
+    for p in paths:
+        try:
+            loader = PyPDFLoader(str(p))
+            file_docs = loader.load()
+            for d in file_docs:
+                d.metadata = d.metadata or {}
+                d.metadata["source"] = p.name
+            docs.extend(file_docs)
+        except Exception as e:
+            st.error(f"Failed to load {p.name}: {e}")
+    return docs
+
+
+def find_repo_pdfs(repo_dir: Path) -> List[Path]:
+    """
+    Discover PDFs in the repository.
+    Priority: 'manual.pdf' in repo root; also include any other *.pdf in the root.
+    Extend this to search subfolders if you prefer (e.g., repo_dir.rglob('*.pdf')).
+    """
+    candidates: List[Path] = []
+    manual = repo_dir / "manual.pdf"
+    if manual.exists() and manual.is_file():
+        candidates.append(manual)
+
+    # Also pick up any other PDFs in the repo root (excluding manual if already added)
+    for p in sorted(repo_dir.glob("*.pdf")):
+        if p not in candidates:
+            candidates.append(p)
+
+    return candidates
 
 
 @st.cache_resource(show_spinner=False)
@@ -142,9 +183,7 @@ def clear_index(persist_dir: str):
         pass
 
 
-def simple_rag_answer(
-    vs: Chroma, model_name: str, query: str, k: int
-) -> Tuple[str, List]:
+def simple_rag_answer(vs: Chroma, model_name: str, query: str, k: int) -> Tuple[str, List]:
     """
     Minimal RAG without langchain.chains:
     1) Retrieve top-k docs
@@ -154,15 +193,15 @@ def simple_rag_answer(
     retriever = vs.as_retriever(search_kwargs={"k": k})
     docs = retriever.get_relevant_documents(query)
 
-    # assemble context (keep it under control to avoid token bloat)
     def snippet(t: str, limit: int = 1200) -> str:
         t = t.strip().replace("\n", " ").replace("  ", " ")
         return t[:limit] + ("…" if len(t) > limit else "")
 
     context_blocks = []
     for i, d in enumerate(docs, 1):
-        src = (d.metadata or {}).get("source", "unknown.pdf")
-        page = (d.metadata or {}).get("page", "?")
+        meta = d.metadata or {}
+        src = meta.get("source", "unknown.pdf")
+        page = meta.get("page", "?")
         context_blocks.append(f"[{i}] {src} (page {page})\n{snippet(d.page_content)}")
 
     context = "\n\n".join(context_blocks) if context_blocks else "No context retrieved."
@@ -183,14 +222,25 @@ def simple_rag_answer(
     answer_text = getattr(resp, "content", "") if resp else ""
     return answer_text.strip(), docs
 
-# --------------------------- MAIN UI --------------------------- #
-st.subheader("1) Upload PDFs to index")
-uploaded = st.file_uploader("Drag & drop one or more PDF manuals", type=["pdf"], accept_multiple_files=True)
 
-col1, col2 = st.columns([1, 1])
+# --------------------------- MAIN UI --------------------------- #
+st.subheader("1) Index PDFs")
+
+# Discover repo PDFs (e.g., manual.pdf)
+repo_pdf_paths = find_repo_pdfs(REPO_DIR)
+if repo_pdf_paths:
+    st.success(f"Found {len(repo_pdf_paths)} PDF(s) in repo: " + ", ".join(p.name for p in repo_pdf_paths))
+else:
+    st.info("No PDFs found in the repo directory. (Looking in the same folder as app.py)")
+
+uploaded = st.file_uploader("Drag & drop PDFs to add", type=["pdf"], accept_multiple_files=True)
+
+col1, col2, col3 = st.columns([1, 1, 1])
 with col1:
-    rebuild = st.button("🔨 Re-index uploaded PDFs", type="primary", disabled=(not uploaded))
+    rebuild_uploaded = st.button("🔨 Re-index uploaded PDFs", type="primary", disabled=(not uploaded))
 with col2:
+    rebuild_repo = st.button("📦 Index repo PDFs (e.g., manual.pdf)", type="secondary", disabled=(not repo_pdf_paths))
+with col3:
     wiped = st.button("🗑️ Clear existing index", type="secondary")
 
 if wiped:
@@ -199,9 +249,11 @@ if wiped:
     st.success("Cleared index. Rebuild with new PDFs when ready.")
 
 vs = None
+indexed_from = None
 
-if rebuild and uploaded:
-    with st.spinner("Building index…"):
+# Option 1: Index uploaded PDFs
+if rebuild_uploaded and uploaded:
+    with st.spinner("Building index from uploaded PDFs…"):
         docs = load_pdfs_to_docs(uploaded)
         build_or_load_vectorstore.clear()
         vs = build_or_load_vectorstore(
@@ -212,33 +264,66 @@ if rebuild and uploaded:
             persist_dir=PERSIST_DIR,
             collection_name=COLLECTION,
         )
-        st.success(f"Indexed {len(docs)} pages across {len(uploaded)} file(s).")
+        indexed_from = f"{len(uploaded)} uploaded file(s)"
+        st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
 
-# If not rebuilding now, try to load an existing store
-if vs is None:
-    try:
+# Option 2: Index repo PDFs
+if rebuild_repo and repo_pdf_paths:
+    with st.spinner("Building index from repo PDFs…"):
+        docs = load_repo_pdfs_to_docs(repo_pdf_paths)
+        build_or_load_vectorstore.clear()
         vs = build_or_load_vectorstore(
-            docs=[],
+            docs=docs,
             embedding_model_name=embed_model,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             persist_dir=PERSIST_DIR,
             collection_name=COLLECTION,
         )
+        indexed_from = f"{len(repo_pdf_paths)} repo file(s)"
+        st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
+
+# If no explicit rebuild, try to load existing store (and optionally auto-index repo PDFs)
+if vs is None:
+    index_exists = Path(PERSIST_DIR).exists() and any(Path(PERSIST_DIR).glob("**/*"))
+    try:
+        if not index_exists and auto_index_repo and repo_pdf_paths:
+            with st.spinner("No existing index. Auto-indexing repo PDFs…"):
+                docs = load_repo_pdfs_to_docs(repo_pdf_paths)
+                build_or_load_vectorstore.clear()
+                vs = build_or_load_vectorstore(
+                    docs=docs,
+                    embedding_model_name=embed_model,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    persist_dir=PERSIST_DIR,
+                    collection_name=COLLECTION,
+                )
+                indexed_from = f"{len(repo_pdf_paths)} repo file(s) (auto)"
+                st.success(f"Indexed {len(docs)} pages from {indexed_from}.")
+        else:
+            vs = build_or_load_vectorstore(
+                docs=[],
+                embedding_model_name=embed_model,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                persist_dir=PERSIST_DIR,
+                collection_name=COLLECTION,
+            )
     except Exception:
-        st.info("No existing index yet. Upload PDFs and click **Re-index**.")
+        st.info("No existing index yet. Upload PDFs or click **Index repo PDFs**.")
 
 st.divider()
 st.subheader("2) Ask questions about your manuals")
 
-query = st.text_input("Your question", placeholder="e.g., How do I reset the inverter?")
+query = st.text_input("Your question", placeholder="e.g., What does the safety section say about battery isolation?")
 ask = st.button("💬 Ask")
 
 if ask:
     if not OPENAI_API_KEY:
         st.error("Missing `OPENAI_API_KEY`. Set it in your environment.")
     elif vs is None:
-        st.error("No vector store available. Upload PDFs and click **Re-index** first.")
+        st.error("No vector store available. Upload PDFs or index repo PDFs first.")
     else:
         try:
             with st.spinner("Thinking…"):
@@ -259,6 +344,13 @@ if ask:
 
 st.divider()
 with st.expander("ℹ️ Debug / Info"):
+    st.write("Repo dir:", str(REPO_DIR))
+    st.write("Repo PDFs found:", [p.name for p in repo_pdf_paths])
+    for p in repo_pdf_paths:
+        try:
+            st.write(f"- {p.name}: exists={p.exists()}, size={p.stat().st_size} bytes")
+        except Exception:
+            st.write(f"- {p.name}: (stat unavailable)")
     st.write("Persist directory:", PERSIST_DIR)
     st.write("Collection name:", COLLECTION)
     st.write("LLM model:", llm_model)
